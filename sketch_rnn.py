@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import matplotlib.pyplot as plt
 import PIL
@@ -6,6 +8,8 @@ import torch
 import torch.nn as nn
 from torch import optim
 import torch.nn.functional as F
+
+import argparse
 
 use_cuda = torch.cuda.is_available()
 
@@ -68,7 +72,7 @@ def normalize(strokes):
         data.append(seq)
     return data
 
-dataset = np.load(hp.data_location, encoding='latin1')
+dataset = np.load(hp.data_location, allow_pickle=True, encoding='latin1')
 data = dataset['train']
 data = purify(data)
 data = normalize(data)
@@ -94,9 +98,11 @@ def make_batch(batch_size):
         indice += 1
 
     if use_cuda:
-        batch = Variable(torch.from_numpy(np.stack(strokes,1)).cuda().float())
+        #batch = Variable(torch.from_numpy(np.stack(strokes,1)).cuda().float())
+        batch = torch.from_numpy(np.stack(strokes,1)).cuda().float()
     else:
-        batch = Variable(torch.from_numpy(np.stack(strokes,1)).float())
+        #batch = Variable(torch.from_numpy(np.stack(strokes,1)).float())
+        batch = torch.from_numpy(np.stack(strokes,1)).float()
     return batch, lengths
 
 ################################ adaptive lr
@@ -125,7 +131,7 @@ class EncoderRNN(nn.Module):
             # then must init with zeros
             if use_cuda:
                 hidden = torch.zeros(2, batch_size, hp.enc_hidden_size).cuda()
-                cell = torch.zeros(2, batch_size, hp.enc_hidden_size.cuda()
+                cell = torch.zeros(2, batch_size, hp.enc_hidden_size).cuda()
             else:
                 hidden = torch.zeros(2, batch_size, hp.enc_hidden_size)
                 cell = torch.zeros(2, batch_size, hp.enc_hidden_size)
@@ -146,7 +152,7 @@ class EncoderRNN(nn.Module):
             N = torch.normal(torch.zeros(z_size),torch.ones(z_size))
         z = mu + sigma*N
         # mu and sigma_hat are needed for LKL loss
-        return z, mu, sigma_hat
+        return z, mu, sigma_hat, N
 
 class DecoderRNN(nn.Module):
     def __init__(self):
@@ -193,7 +199,7 @@ class DecoderRNN(nn.Module):
         return pi,mu_x,mu_y,sigma_x,sigma_y,rho_xy,q,hidden,cell
 
 class Model():
-    def __init__(self):
+    def __init__(self, args):
         if use_cuda:
             self.encoder = EncoderRNN().cuda()
             self.decoder = DecoderRNN().cuda()
@@ -203,6 +209,8 @@ class Model():
         self.encoder_optimizer = optim.Adam(self.encoder.parameters(), hp.lr)
         self.decoder_optimizer = optim.Adam(self.decoder.parameters(), hp.lr)
         self.eta_step = hp.eta_min
+
+        self.args = args
 
     def make_target(self, batch, lengths):
         if use_cuda:
@@ -228,7 +236,7 @@ class Model():
         self.decoder.train()
         batch, lengths = make_batch(hp.batch_size)
         # encode:
-        z, self.mu, self.sigma = self.encoder(batch, hp.batch_size)
+        z, self.mu, self.sigma, _ = self.encoder(batch, hp.batch_size)
         # create start of sequence:
         if use_cuda:
             sos = torch.stack([torch.Tensor([0,0,1,0,0])]*hp.batch_size).cuda().unsqueeze(0)
@@ -264,7 +272,7 @@ class Model():
         self.decoder_optimizer.step()
         # some print and save:
         if epoch%1==0:
-            print('epoch',epoch,'loss',loss.data[0],'LR',LR.data[0],'LKL',LKL.data[0])
+            print('epoch',epoch,'loss',loss.data.item(),'LR',LR.data.item(),'LKL',LKL.data.item())
             self.encoder_optimizer = lr_decay(self.encoder_optimizer)
             self.decoder_optimizer = lr_decay(self.decoder_optimizer)
         if epoch%100==0:
@@ -291,9 +299,11 @@ class Model():
         LKL = -0.5*torch.sum(1+self.sigma-self.mu**2-torch.exp(self.sigma))\
             /float(hp.Nz*hp.batch_size)
         if use_cuda:
-            KL_min = Variable(torch.Tensor([hp.KL_min]).cuda()).detach()
+            #KL_min = Variable(torch.Tensor([hp.KL_min]).cuda()).detach()
+            KL_min = torch.Tensor([hp.KL_min]).cuda().detach()
         else:
-            KL_min = Variable(torch.Tensor([hp.KL_min])).detach()
+            #KL_min = Variable(torch.Tensor([hp.KL_min])).detach()
+            KL_min = torch.Tensor([hp.KL_min]).detach()
         return hp.wKL*self.eta_step * torch.max(LKL,KL_min)
 
     def save(self, epoch):
@@ -311,15 +321,21 @@ class Model():
 
     def conditional_generation(self, epoch):
         batch,lengths = make_batch(1)
+
+        #make_image_from_batch(batch)
+
         # should remove dropouts:
         self.encoder.train(False)
         self.decoder.train(False)
         # encode:
-        z, _, _ = self.encoder(batch, 1)
+        z, _, _, N = self.encoder(batch, 1)
+
         if use_cuda:
-            sos = Variable(torch.Tensor([0,0,1,0,0]).view(1,1,-1).cuda())
+            #sos = Variable(torch.Tensor([0,0,1,0,0]).view(1,1,-1).cuda())
+            sos = torch.Tensor([0,0,1,0,0]).view(1,1,-1).cuda()
         else:
-            sos = Variable(torch.Tensor([0,0,1,0,0]).view(1,1,-1))
+            #sos = Variable(torch.Tensor([0,0,1,0,0]).view(1,1,-1))
+            sos = torch.Tensor([0,0,1,0,0]).view(1,1,-1)
         s = sos
         seq_x = []
         seq_y = []
@@ -346,7 +362,7 @@ class Model():
         y_sample = np.cumsum(seq_y, 0)
         z_sample = np.array(seq_z)
         sequence = np.stack([x_sample,y_sample,z_sample]).T
-        make_image(sequence, epoch)
+        make_image(sequence, epoch, self.args)
 
     def sample_next_state(self):
 
@@ -366,20 +382,22 @@ class Model():
         q = adjust_temp(q)
         q_idx = np.random.choice(3, p=q)
         # get mixture params:
-        mu_x = self.mu_x.data[0,0,pi_idx]
-        mu_y = self.mu_y.data[0,0,pi_idx]
-        sigma_x = self.sigma_x.data[0,0,pi_idx]
-        sigma_y = self.sigma_y.data[0,0,pi_idx]
-        rho_xy = self.rho_xy.data[0,0,pi_idx]
+        mu_x = self.mu_x.data[0,0,pi_idx].item()
+        mu_y = self.mu_y.data[0,0,pi_idx].item()
+        sigma_x = self.sigma_x.data[0,0,pi_idx].item()
+        sigma_y = self.sigma_y.data[0,0,pi_idx].item()
+        rho_xy = self.rho_xy.data[0,0,pi_idx].item()
         x,y = sample_bivariate_normal(mu_x,mu_y,sigma_x,sigma_y,rho_xy,greedy=False)
         next_state = torch.zeros(5)
         next_state[0] = x
         next_state[1] = y
         next_state[q_idx+2] = 1
         if use_cuda:
-            return Variable(next_state.cuda()).view(1,1,-1),x,y,q_idx==1,q_idx==2
+            #return Variable(next_state.cuda()).view(1,1,-1),x,y,q_idx==1,q_idx==2
+            return next_state.cuda().view(1,1,-1),x,y,q_idx==1,q_idx==2
         else:
-            return Variable(next_state).view(1,1,-1),x,y,q_idx==1,q_idx==2
+            #return Variable(next_state).view(1,1,-1),x,y,q_idx==1,q_idx==2
+            return next_state.view(1,1,-1),x,y,q_idx==1,q_idx==2
 
 def sample_bivariate_normal(mu_x,mu_y,sigma_x,sigma_y,rho_xy, greedy=False):
     # inputs must be floats
@@ -393,7 +411,14 @@ def sample_bivariate_normal(mu_x,mu_y,sigma_x,sigma_y,rho_xy, greedy=False):
     x = np.random.multivariate_normal(mean, cov, 1)
     return x[0][0], x[0][1]
 
-def make_image(sequence, epoch, name='_output_'):
+def make_image_from_batch(batch):
+    batch = batch.squeeze()
+    print('--')
+    print(batch.size())
+    print('--')
+    return 1
+
+def make_image(sequence, epoch, args, name='_output_'):
     """plot drawing with separated strokes"""
     strokes = np.split(sequence, np.where(sequence[:,2]>0)[0]+1)
     fig = plt.figure()
@@ -404,12 +429,28 @@ def make_image(sequence, epoch, name='_output_'):
     canvas.draw()
     pil_image = PIL.Image.frombytes('RGB', canvas.get_width_height(),
                  canvas.tostring_rgb())
-    name = str(epoch)+name+'.jpg'
+    name = os.path.join(args.out_dir, str(epoch)+name+'.jpg')
     pil_image.save(name,"JPEG")
     plt.close("all")
 
 if __name__=="__main__":
-    model = Model()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--name', default='default', type=str)
+    args = parser.parse_args()
+    print('args.name: ', args.name)
+    args.out_dir = os.path.join('out', args.name)
+
+    cwd = os.getcwd()
+    _out_dir = os.path.join(cwd, 'out')
+    out_dir = os.path.join(_out_dir, args.name)
+    if not os.path.exists(_out_dir):
+        os.mkdir(_out_dir)
+        print('created ', _out_dir)
+    if not os.path.exists(out_dir):
+        os.mkdir(out_dir)
+        print('created ', out_dir)
+
+    model = Model(args)
     for epoch in range(50001):
         model.train(epoch)
 
