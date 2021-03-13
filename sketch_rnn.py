@@ -35,7 +35,7 @@ class HParams():
         self.lr_decay = 0.9999
         self.min_lr = 0.00001
         self.grad_clip = 1.
-        self.temperature = 0.02
+        self.temperature = 0.2
         self.max_seq_length = 200
 
 hp = HParams()
@@ -154,6 +154,22 @@ def lr_decay(optimizer):
     return optimizer
 
 ################################# encoder and decoder modules
+
+class Disc(nn.Module):
+    def __init__(self, N, z_dim):
+        super(Disc, self).__init__()
+        self.lin1 = nn.Linear(z_dim, N)
+        self.lin2 = nn.Linear(N,N)
+        self.lin3 = nn.Linear(N,1)
+
+    def forward(self, x):
+        x = F.dropout(self.lin1(x), p=0.2, training=self.training)
+        x = F.relu(x)
+        x = F.dropout(self.lin2(x), p=0.2, training=self.training)
+        x = F.relu(x)
+        return F.sigmoid(self.lin3(x)) 
+
+
 class EncoderRNN(nn.Module):
     def __init__(self):
         super(EncoderRNN, self).__init__()
@@ -247,12 +263,16 @@ class Model():
         if use_cuda:
             self.encoder = EncoderRNN().cuda()
             self.decoder = DecoderRNN().cuda()
+            self.disc = Disc(128,128).cuda()
         else:
             self.encoder = EncoderRNN()
             self.decoder = DecoderRNN()
+            self.disc = Disc()
         self.writer = writer
         self.encoder_optimizer = optim.Adam(self.encoder.parameters(), hp.lr)
         self.decoder_optimizer = optim.Adam(self.decoder.parameters(), hp.lr)
+        self.disc_optimizer = optim.Adam(self.disc.parameters(), hp.lr)
+        self.gen_optimizer = optim.Adam(self.encoder.parameters(), hp.lr)
         self.eta_step = hp.eta_min
 
         self.args = args
@@ -329,6 +349,10 @@ class Model():
         if args.model == 'MMD':
             LMMD = args.dist_lambda * self.mmd_loss(z)
             loss = LR + LMMD
+        elif args.model == 'AAE':
+            self.disc_optimizer.zero_grad()
+            self.gen_optimizer.zero_grad()
+            loss = LR
         else:
             LKL = args.dist_lambda * self.kullback_leibler_loss()
             loss = LR + LKL
@@ -340,16 +364,45 @@ class Model():
         # optim step
         self.encoder_optimizer.step()
         self.decoder_optimizer.step()
+
+        if args.model == 'AAE':
+            # discriminator
+            self.encoder.eval()
+            z_real = torch.randn(100, 128, requires_grad=False).cuda()
+            D_real = self.disc(z_real)
+            z_fake, _, _, _ = self.encoder(batch, hp.batch_size)
+            z_fake = z_fake.detach()
+            D_fake = self.disc(z_fake)
+
+            EPS = 1e-15
+            L_D = -torch.mean(torch.log(D_real + EPS) + torch.log(1 - D_fake + EPS))
+            L_D.backward()
+            self.disc_optimizer.step()
+
+            # generator
+            self.encoder.train()
+            z_fake, _, _, _ = self.encoder(batch, hp.batch_size)
+            D_fake = self.disc(z_fake)
+
+            L_G = -torch.mean(torch.log(D_fake + EPS))
+            L_G.backward()
+            self.gen_optimizer.step() 
+
         # some print and save:
         if epoch%1==0:
             if args.model == 'MMD':
                 print('epoch',epoch,'loss',loss.data.item(),'LR',LR.data.item(),'LMMD',LMMD.data.item())
+            elif args.model == 'AAE':
+                print('epoch',epoch, 'LR',LR.data.item(),'L_D', L_D.data.item(),'L_G', L_G.data.item())
             else:
                 print('epoch',epoch,'loss',loss.data.item(),'LR',LR.data.item(),'LKL',LKL.data.item())
 
             self.encoder_optimizer = lr_decay(self.encoder_optimizer)
             self.decoder_optimizer = lr_decay(self.decoder_optimizer)
-        if epoch%10000==0:
+            self.disc_optimizer = lr_decay(self.disc_optimizer)
+            self.gen_optimizer = lr_decay(self.gen_optimizer)
+
+        if epoch%20000==0:
             self.save(epoch, self.args)
             self.conditional_generation(epoch)
             self.conditional_generation(epoch, test=True)
@@ -358,6 +411,8 @@ class Model():
 
         if args.model == 'MMD':
             return loss.data.item(), LR.data.item(), LMMD.data.item()
+        elif args.model == 'AAE':
+            return loss.data.item(), L_D.data.item(), L_G.data.item()
         else:
             return loss.data.item(), LR.data.item(), LKL.data.item()
 
@@ -816,9 +871,16 @@ if __name__=="__main__":
         print('====start training====')
         for epoch in range(50001):
             L, LR, LD = model.train(epoch)
-            L_te, LR_te, LD_te = model.cal_test_loss(epoch)
+            if args.model != 'AAE':
+                L_te, LR_te, LD_te = model.cal_test_loss(epoch)
 
-            writer.add_scalars('loss', {'L_train': L, 'LR_train': LR, 'LD_train': LD, 'L_test': L_te, 'LR_test': LR_te, 'LD_test': LD_te}, epoch)
+            if args.model == 'AAE':
+                l_r = L
+                l_d = LR
+                l_g = LD
+                writer.add_scalars('loss', {'LR': l_r, 'L_D': l_d, 'L_G': l_g}, epoch)
+            else:
+                writer.add_scalars('loss', {'L_train': L, 'LR_train': LR, 'LD_train': LD, 'L_test': L_te, 'LR_test': LR_te, 'LD_test': LD_te}, epoch)
 
         writer.close()
 
