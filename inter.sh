@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=1 python sketch_rnn.py  --name default --load True --encoder_path out/default/encoderRNN_sel_0.036154_epoch_30000.pth --decoder_path out/default/decoderRNN_sel_0.036154_epoch_30000.pth

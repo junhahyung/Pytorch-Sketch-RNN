@@ -11,6 +11,10 @@ import torch.nn.functional as F
 
 import argparse
 
+from sklearn.decomposition import PCA
+
+from tensorboardX import SummaryWriter
+
 use_cuda = torch.cuda.is_available()
 
 ###################################### hyperparameters
@@ -26,12 +30,12 @@ class HParams():
         self.eta_min = 0.01
         self.R = 0.99995
         self.KL_min = 0.2
-        self.wKL = 0.5
+        self.wKL = 1
         self.lr = 0.001
         self.lr_decay = 0.9999
         self.min_lr = 0.00001
         self.grad_clip = 1.
-        self.temperature = 0.4
+        self.temperature = 0.02
         self.max_seq_length = 200
 
 hp = HParams()
@@ -76,7 +80,16 @@ dataset = np.load(hp.data_location, allow_pickle=True, encoding='latin1')
 data = dataset['train']
 data = purify(data)
 data = normalize(data)
+print('train data size: ', len(data))
 Nmax = max_size(data)
+print('train max len: ', Nmax)
+
+test_data = dataset['test']
+test_data = purify(test_data)
+test_data = normalize(test_data)
+print('test data size: ', len(test_data))
+test_Nmax = max_size(test_data)
+print('test max len: ', test_Nmax)
 
 ############################## function to generate a batch:
 def make_batch(batch_size):
@@ -105,6 +118,33 @@ def make_batch(batch_size):
         batch = torch.from_numpy(np.stack(strokes,1)).float()
     return batch, lengths
 
+def make_test_batch(batch_idx):
+    #batch_idx = np.random.choice(len(data),batch_size)
+    if type(batch_idx) == int:
+        batch_idx = [batch_idx]
+    batch_sequences = [data[idx] for idx in batch_idx]
+    strokes = []
+    lengths = []
+    indice = 0
+    for seq in batch_sequences:
+        len_seq = len(seq[:,0])
+        new_seq = np.zeros((Nmax,5))
+        new_seq[:len_seq,:2] = seq[:,:2]
+        new_seq[:len_seq-1,2] = 1-seq[:-1,2]
+        new_seq[:len_seq,3] = seq[:,2]
+        new_seq[(len_seq-1):,4] = 1
+        new_seq[len_seq-1,2:4] = 0
+        lengths.append(len(seq[:,0]))
+        strokes.append(new_seq)
+        indice += 1
+
+    if use_cuda:
+        #batch = Variable(torch.from_numpy(np.stack(strokes,1)).cuda().float())
+        batch = torch.from_numpy(np.stack(strokes,1)).cuda().float()
+    else:
+        #batch = Variable(torch.from_numpy(np.stack(strokes,1)).float())
+        batch = torch.from_numpy(np.stack(strokes,1)).float()
+    return batch, lengths
 ################################ adaptive lr
 def lr_decay(optimizer):
     """Decay learning rate by a factor of lr_decay"""
@@ -167,7 +207,9 @@ class DecoderRNN(nn.Module):
     def forward(self, inputs, z, hidden_cell=None):
         if hidden_cell is None:
             # then we must init from z
-            hidden,cell = torch.split(F.tanh(self.fc_hc(z)),hp.dec_hidden_size,1)
+            #hidden,cell = torch.split(F.tanh(self.fc_hc(z)),hp.dec_hidden_size,1)
+            hidden,cell = torch.split(torch.tanh(self.fc_hc(z)),hp.dec_hidden_size,1)
+
             hidden_cell = (hidden.unsqueeze(0).contiguous(), cell.unsqueeze(0).contiguous())
         outputs,(hidden,cell) = self.lstm(inputs, hidden_cell)
         # in training we feed the lstm with the whole input in one shot
@@ -189,23 +231,26 @@ class DecoderRNN(nn.Module):
         else:
             len_out = 1
                                    
-        pi = F.softmax(pi.transpose(0,1).squeeze()).view(len_out,-1,hp.M)
+        #pi = F.softmax(pi.transpose(0,1).squeeze()).view(len_out,-1,hp.M)
+        pi = F.softmax(pi.transpose(0,1).squeeze(), dim=-1).view(len_out,-1,hp.M)
         sigma_x = torch.exp(sigma_x.transpose(0,1).squeeze()).view(len_out,-1,hp.M)
         sigma_y = torch.exp(sigma_y.transpose(0,1).squeeze()).view(len_out,-1,hp.M)
         rho_xy = torch.tanh(rho_xy.transpose(0,1).squeeze()).view(len_out,-1,hp.M)
         mu_x = mu_x.transpose(0,1).squeeze().contiguous().view(len_out,-1,hp.M)
         mu_y = mu_y.transpose(0,1).squeeze().contiguous().view(len_out,-1,hp.M)
-        q = F.softmax(params_pen).view(len_out,-1,3)
+        #q = F.softmax(params_pen).view(len_out,-1,3)
+        q = F.softmax(params_pen, dim=1).view(len_out,-1,3)
         return pi,mu_x,mu_y,sigma_x,sigma_y,rho_xy,q,hidden,cell
 
 class Model():
-    def __init__(self, args):
+    def __init__(self, args, writer):
         if use_cuda:
             self.encoder = EncoderRNN().cuda()
             self.decoder = DecoderRNN().cuda()
         else:
             self.encoder = EncoderRNN()
             self.decoder = DecoderRNN()
+        self.writer = writer
         self.encoder_optimizer = optim.Adam(self.encoder.parameters(), hp.lr)
         self.decoder_optimizer = optim.Adam(self.decoder.parameters(), hp.lr)
         self.eta_step = hp.eta_min
@@ -230,6 +275,27 @@ class Model():
         p3 = batch.data[:,:,4]
         p = torch.stack([p1,p2,p3],2)
         return mask,dx,dy,p
+
+
+    @staticmethod
+    def gaussian_kernel(a, b):
+        dim1_1, dim1_2 = a.shape[0], b.shape[0]
+        depth = a.shape[1]
+        a = a.view(dim1_1, 1, depth)
+        b = b.view(1, dim1_2, depth)
+        a_core = a.expand(dim1_1, dim1_2, depth)
+        b_core = b.expand(dim1_1, dim1_2, depth)
+        numerator = (a_core - b_core).pow(2).mean(2)/depth
+        return torch.exp(-numerator)
+
+
+    def MMD(self, a, b):
+        return self.gaussian_kernel(a, a).mean() + self.gaussian_kernel(b, b).mean() - 2*self.gaussian_kernel(a, b).mean()
+
+
+    def mmd_loss(self, latent):
+        return self.MMD(torch.randn(200, hp.Nz, requires_grad = False).cuda(), latent)
+
 
     def train(self, epoch):
         self.encoder.train()
@@ -259,25 +325,82 @@ class Model():
         # update eta for LKL:
         self.eta_step = 1-(1-hp.eta_min)*hp.R
         # compute losses:
-        LKL = self.kullback_leibler_loss()
         LR = self.reconstruction_loss(mask,dx,dy,p,epoch)
-        loss = LR + LKL
+        if args.model == 'MMD':
+            LMMD = args.dist_lambda * self.mmd_loss(z)
+            loss = LR + LMMD
+        else:
+            LKL = args.dist_lambda * self.kullback_leibler_loss()
+            loss = LR + LKL
         # gradient step
         loss.backward()
         # gradient cliping
-        nn.utils.clip_grad_norm(self.encoder.parameters(), hp.grad_clip)
-        nn.utils.clip_grad_norm(self.decoder.parameters(), hp.grad_clip)
+        nn.utils.clip_grad_norm_(self.encoder.parameters(), hp.grad_clip)
+        nn.utils.clip_grad_norm_(self.decoder.parameters(), hp.grad_clip)
         # optim step
         self.encoder_optimizer.step()
         self.decoder_optimizer.step()
         # some print and save:
         if epoch%1==0:
-            print('epoch',epoch,'loss',loss.data.item(),'LR',LR.data.item(),'LKL',LKL.data.item())
+            if args.model == 'MMD':
+                print('epoch',epoch,'loss',loss.data.item(),'LR',LR.data.item(),'LMMD',LMMD.data.item())
+            else:
+                print('epoch',epoch,'loss',loss.data.item(),'LR',LR.data.item(),'LKL',LKL.data.item())
+
             self.encoder_optimizer = lr_decay(self.encoder_optimizer)
             self.decoder_optimizer = lr_decay(self.decoder_optimizer)
-        if epoch%100==0:
-            #self.save(epoch)
+        if epoch%10000==0:
+            self.save(epoch, self.args)
             self.conditional_generation(epoch)
+            self.conditional_generation(epoch, test=True)
+            self.interpolate(epoch)
+            self.get_pca(epoch)
+
+        if args.model == 'MMD':
+            return loss.data.item(), LR.data.item(), LMMD.data.item()
+        else:
+            return loss.data.item(), LR.data.item(), LKL.data.item()
+
+    def cal_test_loss(self, epoch):
+        with torch.no_grad():
+            self.encoder.train()
+            self.decoder.train()
+            batch_idx = np.random.choice(len(test_data),hp.batch_size)
+            batch, lengths = make_test_batch(batch_idx)
+            # encode:
+            z, self.mu, self.sigma, _ = self.encoder(batch, hp.batch_size)
+            # create start of sequence:
+            if use_cuda:
+                sos = torch.stack([torch.Tensor([0,0,1,0,0])]*hp.batch_size).cuda().unsqueeze(0)
+            else:
+                sos = torch.stack([torch.Tensor([0,0,1,0,0])]*hp.batch_size).unsqueeze(0)
+            # had sos at the begining of the batch:
+            batch_init = torch.cat([sos, batch],0)
+            # expend z to be ready to concatenate with inputs:
+            z_stack = torch.stack([z]*(Nmax+1))
+            # inputs is concatenation of z and batch_inputs
+            inputs = torch.cat([batch_init, z_stack],2)
+            # decode:
+            self.pi, self.mu_x, self.mu_y, self.sigma_x, self.sigma_y, \
+                self.rho_xy, self.q, _, _ = self.decoder(inputs, z)
+            # prepare targets:
+            mask,dx,dy,p = self.make_target(batch, lengths)
+            # compute losses:
+            LR = self.reconstruction_loss(mask,dx,dy,p,epoch)
+            if args.model == 'MMD':
+                LMMD = args.dist_lambda * self.mmd_loss(z)
+                loss = LR + LMMD
+            else:
+                LKL = args.dist_lambda * self.kullback_leibler_loss()
+                loss = LR + LKL
+
+            if args.model == 'MMD':
+                print('[TEST] epoch',epoch,'loss',loss.data.item(),'LR',LR.data.item(),'LMMD',LMMD.data.item())
+                return loss.data.item(), LR.data.item(), LMMD.data.item()
+            else:
+                print('[TEST] epoch',epoch,'loss',loss.data.item(),'LR',LR.data.item(),'LKL',LKL.data.item())
+                return loss.data.item(), LR.data.item(), LKL.data.item()
+
 
     def bivariate_normal_pdf(self, dx, dy):
         z_x = ((dx-self.mu_x)/self.sigma_x)**2
@@ -306,12 +429,14 @@ class Model():
             KL_min = torch.Tensor([hp.KL_min]).detach()
         return hp.wKL*self.eta_step * torch.max(LKL,KL_min)
 
-    def save(self, epoch):
+    def save(self, epoch, args):
         sel = np.random.rand()
+        enc_name = os.path.join(args.out_dir, 'encoderRNN_sel_%3f_epoch_%d.pth' % (sel,epoch))
+        dec_name = os.path.join(args.out_dir, 'decoderRNN_sel_%3f_epoch_%d.pth' % (sel,epoch))
         torch.save(self.encoder.state_dict(), \
-            'encoderRNN_sel_%3f_epoch_%d.pth' % (sel,epoch))
+                enc_name)
         torch.save(self.decoder.state_dict(), \
-            'decoderRNN_sel_%3f_epoch_%d.pth' % (sel,epoch))
+                dec_name)
 
     def load(self, encoder_name, decoder_name):
         saved_encoder = torch.load(encoder_name)
@@ -319,50 +444,177 @@ class Model():
         self.encoder.load_state_dict(saved_encoder)
         self.decoder.load_state_dict(saved_decoder)
 
-    def conditional_generation(self, epoch):
-        batch,lengths = make_batch(1)
-
-        #make_image_from_batch(batch)
-
-        # should remove dropouts:
+    def get_pca(self, epoch):
+        Mus = []
+        input_seqs = []
         self.encoder.train(False)
         self.decoder.train(False)
-        # encode:
-        z, _, _, N = self.encoder(batch, 1)
 
-        if use_cuda:
-            #sos = Variable(torch.Tensor([0,0,1,0,0]).view(1,1,-1).cuda())
-            sos = torch.Tensor([0,0,1,0,0]).view(1,1,-1).cuda()
+        for idx in range(200):
+            batch,lengths = make_batch(1)
+            input_seq = make_image_from_batch(batch, epoch, self.args)
+
+            z, M, _, _ = self.encoder(batch, 1)
+            Mus.append(np.array(z.squeeze().detach().cpu()))
+            input_seqs.append(input_seq)
+
+        Mus = np.array(Mus)
+        make_image_pca(input_seqs, Mus, epoch, self.args, name='_pca_200')
+
+    def interpolate(self, epoch):
+        pairs = [[1,3],[1,5],[1,9],[1,13],[4,13],[5,7]]
+        for idx, pair in enumerate(pairs): 
+            batch_1, length_1 = make_test_batch(pair[0])
+            batch_2, length_2 = make_test_batch(pair[1])
+
+            seqs = []
+
+            self.encoder.train(False)
+            self.decoder.train(False)
+
+            input_seq_1 = make_image_from_batch(batch_1, epoch, self.args)
+            input_seq_2 = make_image_from_batch(batch_2, epoch, self.args)
+
+            _, M_1, _, _ = self.encoder(batch_1, 1)
+            _, M_2, _, _ = self.encoder(batch_2, 1)
+
+            seqs.append(input_seq_1)
+
+            for i in range(9):
+
+                z = M_1 * (9-i)/10. + M_2 * (i+1)/10.
+                if use_cuda:
+                    sos = torch.Tensor([0,0,1,0,0]).view(1,1,-1).cuda()
+                else:
+                    sos = torch.Tensor([0,0,1,0,0]).view(1,1,-1)
+                s = sos
+                seq_x = []
+                seq_y = []
+                seq_z = []
+                hidden_cell = None
+                for i in range(Nmax):
+                    input = torch.cat([s,z.unsqueeze(0)],2)
+                    # decode:
+                    self.pi, self.mu_x, self.mu_y, self.sigma_x, self.sigma_y, \
+                        self.rho_xy, self.q, hidden, cell = \
+                            self.decoder(input, z, hidden_cell)
+                    hidden_cell = (hidden, cell)
+                    # sample from parameters:
+                    s, dx, dy, pen_down, eos = self.sample_next_state()
+                    #------
+                    seq_x.append(dx)
+                    seq_y.append(dy)
+                    seq_z.append(pen_down)
+                    if eos:
+                        #print(i)
+                        break
+                # visualize result:
+                x_sample = np.cumsum(seq_x, 0)
+                y_sample = np.cumsum(seq_y, 0)
+                z_sample = np.array(seq_z)
+                sequence = np.stack([x_sample,y_sample,z_sample]).T
+                seqs.append(sequence)
+
+            seqs.append(input_seq_2)
+
+            fig, ax1 = plt.subplots(1,11, figsize=(11, 1.2))
+
+            for _ax in ax1:
+                _ax.set_xticks([])
+                _ax.set_yticks([])
+
+            ax1[0].set_title('input 1')
+            ax1[10].set_title('input 2')
+            #canvas = plt.get_current_fig_manager().canvas
+            #canvas.draw()
+
+            # draw images
+            for i, seq in enumerate(seqs):
+                strokes = np.split(seq, np.where(seq[:,2]>0)[0]+1)
+                col = i
+                _len = 0
+                for s in strokes:
+                    ax1[col].plot(s[:,0],-s[:,1])
+                canvas = plt.get_current_fig_manager().canvas
+                canvas.draw()
+
+            # save img
+            pil_image = PIL.Image.frombytes('RGB', canvas.get_width_height(),
+                         canvas.tostring_rgb())
+
+            _dir = os.path.join(args.out_dir, str(epoch))
+            if not os.path.exists(_dir):
+                os.mkdir(_dir)
+            name = os.path.join(_dir, 'interpolation_'+str(idx)+'.jpg')
+            pil_image.save(name,"JPEG")
+            plt.close("all")
+
+    def conditional_generation(self, epoch, test=False):
+        Mus = []
+        input_seqs = []
+        for idx in range(20):
+            if test:
+                batch, lengths = make_test_batch(idx)
+            else:
+                batch,lengths = make_batch(1)
+            input_seq = make_image_from_batch(batch, epoch, self.args)
+
+            # should remove dropouts:
+            self.encoder.train(False)
+            self.decoder.train(False)
+
+            seqs = []
+
+            z, M, _, _ = self.encoder(batch, 1)
+            Mus.append(np.array(z.squeeze().detach().cpu()))
+            input_seqs.append(input_seq)
+
+            for i in range(9):
+                # encode:
+                z, _, _, N = self.encoder(batch, 1)
+
+                if use_cuda:
+                    #sos = Variable(torch.Tensor([0,0,1,0,0]).view(1,1,-1).cuda())
+                    sos = torch.Tensor([0,0,1,0,0]).view(1,1,-1).cuda()
+                else:
+                    #sos = Variable(torch.Tensor([0,0,1,0,0]).view(1,1,-1))
+                    sos = torch.Tensor([0,0,1,0,0]).view(1,1,-1)
+                s = sos
+                seq_x = []
+                seq_y = []
+                seq_z = []
+                hidden_cell = None
+                for i in range(Nmax):
+                    input = torch.cat([s,z.unsqueeze(0)],2)
+                    # decode:
+                    self.pi, self.mu_x, self.mu_y, self.sigma_x, self.sigma_y, \
+                        self.rho_xy, self.q, hidden, cell = \
+                            self.decoder(input, z, hidden_cell)
+                    hidden_cell = (hidden, cell)
+                    # sample from parameters:
+                    s, dx, dy, pen_down, eos = self.sample_next_state()
+                    #------
+                    seq_x.append(dx)
+                    seq_y.append(dy)
+                    seq_z.append(pen_down)
+                    if eos:
+                        #print(i)
+                        break
+                # visualize result:
+                x_sample = np.cumsum(seq_x, 0)
+                y_sample = np.cumsum(seq_y, 0)
+                z_sample = np.array(seq_z)
+                sequence = np.stack([x_sample,y_sample,z_sample]).T
+                seqs.append(sequence)
+
+            make_images(input_seq, seqs, epoch, self.args, idx, test)
+        #make_image(sequence, epoch, self.args)
+
+        Mus = np.array(Mus)
+        if test:
+            make_image_pca(input_seqs, Mus, epoch, self.args, name='_pca_test_')
         else:
-            #sos = Variable(torch.Tensor([0,0,1,0,0]).view(1,1,-1))
-            sos = torch.Tensor([0,0,1,0,0]).view(1,1,-1)
-        s = sos
-        seq_x = []
-        seq_y = []
-        seq_z = []
-        hidden_cell = None
-        for i in range(Nmax):
-            input = torch.cat([s,z.unsqueeze(0)],2)
-            # decode:
-            self.pi, self.mu_x, self.mu_y, self.sigma_x, self.sigma_y, \
-                self.rho_xy, self.q, hidden, cell = \
-                    self.decoder(input, z, hidden_cell)
-            hidden_cell = (hidden, cell)
-            # sample from parameters:
-            s, dx, dy, pen_down, eos = self.sample_next_state()
-            #------
-            seq_x.append(dx)
-            seq_y.append(dy)
-            seq_z.append(pen_down)
-            if eos:
-                print(i)
-                break
-        # visualize result:
-        x_sample = np.cumsum(seq_x, 0)
-        y_sample = np.cumsum(seq_y, 0)
-        z_sample = np.array(seq_z)
-        sequence = np.stack([x_sample,y_sample,z_sample]).T
-        make_image(sequence, epoch, self.args)
+            make_image_pca(input_seqs, Mus, epoch, self.args)
 
     def sample_next_state(self):
 
@@ -411,12 +663,26 @@ def sample_bivariate_normal(mu_x,mu_y,sigma_x,sigma_y,rho_xy, greedy=False):
     x = np.random.multivariate_normal(mean, cov, 1)
     return x[0][0], x[0][1]
 
-def make_image_from_batch(batch):
+def make_image_from_batch(batch, epoch, args):
     batch = batch.squeeze()
-    print('--')
-    print(batch.size())
-    print('--')
-    return 1
+    seq_x = []
+    seq_y = []
+    seq_z = []
+    for i in range(batch.size()[0]):
+        dx, dy, p1, p2, eos = batch[i]
+        seq_x.append(dx)
+        seq_y.append(dy)
+        pendown = 1 if p2 else 0
+        seq_z.append(pendown)
+        if eos:
+            break
+
+    x_sample = np.cumsum(seq_x, 0)
+    y_sample = np.cumsum(seq_y, 0)
+    z_sample = np.array(seq_z)
+    sequence = np.stack([x_sample,y_sample,z_sample]).T
+    return sequence
+    #make_image(sequence, epoch, args, 'input')
 
 def make_image(sequence, epoch, args, name='_output_'):
     """plot drawing with separated strokes"""
@@ -433,11 +699,103 @@ def make_image(sequence, epoch, args, name='_output_'):
     pil_image.save(name,"JPEG")
     plt.close("all")
 
+def make_images(input_seq, seqs, epoch, args, idx=0, test=False):
+    #fig = plt.figure()
+    #ax1 = fig.add_subplot(251)
+    fig, ax1 = plt.subplots(2,5, figsize=(10, 4))
+
+    for _ax in ax1:
+        for __ax in _ax:
+            __ax.set_xticks([])
+            __ax.set_yticks([])
+
+    # input img
+    strokes = np.split(input_seq, np.where(input_seq[:,2]>0)[0]+1)
+    _len = 0
+    for s in strokes:
+        ax1[0, 0].plot(s[:,0],-s[:,1])
+        _len += len(s[:,0])
+    ax1[0, 0].set_title('input, len: ' + str(_len+1))
+    #canvas = plt.get_current_fig_manager().canvas
+    #canvas.draw()
+
+    # output img
+    for i, seq in enumerate(seqs):
+        strokes = np.split(seq, np.where(seq[:,2]>0)[0]+1)
+        row = (i+1) // 5
+        col = (i+1) % 5
+        _len = 0
+        for s in strokes:
+            ax1[row, col].plot(s[:,0],-s[:,1])
+            _len += len(s[:,0])
+        ax1[row, col].set_title('len: ' +str(_len+1))
+        canvas = plt.get_current_fig_manager().canvas
+        canvas.draw()
+
+    # save img
+    pil_image = PIL.Image.frombytes('RGB', canvas.get_width_height(),
+                 canvas.tostring_rgb())
+
+    _dir = os.path.join(args.out_dir, str(epoch))
+    if not os.path.exists(_dir):
+        os.mkdir(_dir)
+    name = os.path.join(_dir, '_test_'+str(idx)+'.jpg') if test else os.path.join(_dir, '_'+str(idx)+'.jpg')
+    pil_image.save(name,"JPEG")
+    plt.close("all")
+
+
+def make_image_pca(input_seqs, Mus, epoch, args, name='_pca_'):
+    fig, ax1 = plt.subplots(2,20, figsize=(40, 4))
+
+    '''
+    for _ax in ax1:
+        for __ax in _ax:
+            __ax.set_xticks([])
+            __ax.set_yticks([])
+    '''
+
+    pca = PCA(n_components=2)
+    pca_res = pca.fit_transform(Mus)
+
+    for i in range(20):
+        ax1[1, i].scatter(pca_res[:,0], pca_res[:,1],s=0.3,c='b')
+        ax1[1, i].scatter(pca_res[i,0], pca_res[i,1],c='r')
+
+        ax1[0, i].set_xticks([])
+        ax1[0, i].set_yticks([])
+        strokes = np.split(input_seqs[i], np.where(input_seqs[i][:,2]>0)[0]+1)
+        for s in strokes:
+            ax1[0, i].plot(s[:,0],-s[:,1])
+    
+
+    # save img
+    canvas = plt.get_current_fig_manager().canvas
+    canvas.draw()
+    pil_image = PIL.Image.frombytes('RGB', canvas.get_width_height(),
+                 canvas.tostring_rgb())
+
+    _dir = os.path.join(args.out_dir, str(epoch))
+    if not os.path.exists(_dir):
+        os.mkdir(_dir)
+    name = os.path.join(_dir, name +'.jpg')
+    pil_image.save(name,"JPEG")
+    plt.close("all")
+    
+
 if __name__=="__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--name', default='default', type=str)
+    parser.add_argument('--model', default='default', type=str)
+    parser.add_argument('--dist_lambda', default=1., type=float)
+    parser.add_argument('--load', default=False, type=bool)
+
+    parser.add_argument('--encoder_path', default='', type=str)
+    parser.add_argument('--decoder_path', default='', type=str)
+
     args = parser.parse_args()
     print('args.name: ', args.name)
+    print('args.model: ', args.model)
+    print('args.dst_lambda: ', args.dist_lambda)
     args.out_dir = os.path.join('out', args.name)
 
     cwd = os.getcwd()
@@ -450,12 +808,28 @@ if __name__=="__main__":
         os.mkdir(out_dir)
         print('created ', out_dir)
 
-    model = Model(args)
-    for epoch in range(50001):
-        model.train(epoch)
+    writer = SummaryWriter(logdir=out_dir + '/scalar')
 
-    '''
-    model.load('encoder.pth','decoder.pth')
-    model.conditional_generation(0)
-    #'''
+    model = Model(args, writer)
+
+    if not args.load:
+        print('====start training====')
+        for epoch in range(50001):
+            L, LR, LD = model.train(epoch)
+            L_te, LR_te, LD_te = model.cal_test_loss(epoch)
+
+            writer.add_scalars('loss', {'L_train': L, 'LR_train': LR, 'LD_train': LD, 'L_test': L_te, 'LR_test': LR_te, 'LD_test': LD_te}, epoch)
+
+        writer.close()
+
+    else:
+
+        print('====load and infer only====')
+        decoder_path = args.decoder_path
+        encoder_path = args.encoder_path
+
+        epoch = int(encoder_path.split('_')[-1][:-4])
+        model.load(encoder_path,decoder_path)
+        model.interpolate(epoch)
+        model.conditional_generation(epoch)
 
